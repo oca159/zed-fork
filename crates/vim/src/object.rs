@@ -297,24 +297,14 @@ impl Object {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '`', '`')
             }
             Object::AnyQuotes => {
-                let quote_types = ['\'', '"', '`']; // Types of quotes to handle
-                let relative_offset = relative_to.to_offset(map, Bias::Left) as isize;
-
-                // Find the closest matching quote range
-                quote_types
-                    .iter()
-                    .flat_map(|&quote| {
-                        // Get ranges for each quote type
-                        surrounding_markers(
-                            map,
-                            relative_to,
-                            around,
-                            self.is_multiline(),
-                            quote,
-                            quote,
-                        )
-                    })
-                    .min_by_key(|range| calculate_range_distance(range, relative_offset, map))
+                let quote_markers = vec![('\'', '\''), ('"', '"'), ('`', '`')];
+                find_nearest_surrounding_range(
+                    quote_markers,
+                    map,
+                    relative_to,
+                    around,
+                    self.is_multiline(),
+                )
             }
             Object::DoubleQuotes => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '"', '"')
@@ -331,22 +321,14 @@ impl Object {
                 surrounding_html_tag(map, head, range, around)
             }
             Object::AnyBrackets => {
-                let bracket_pairs = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
-                let relative_offset = relative_to.to_offset(map, Bias::Left) as isize;
-
-                bracket_pairs
-                    .iter()
-                    .flat_map(|&(open_bracket, close_bracket)| {
-                        surrounding_markers(
-                            map,
-                            relative_to,
-                            around,
-                            self.is_multiline(),
-                            open_bracket,
-                            close_bracket,
-                        )
-                    })
-                    .min_by_key(|range| calculate_range_distance(range, relative_offset, map))
+                let bracket_markers = vec![('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
+                find_nearest_surrounding_range(
+                    bracket_markers,
+                    map,
+                    relative_to,
+                    around,
+                    self.is_multiline(),
+                )
             }
             Object::SquareBrackets => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '[', ']')
@@ -402,6 +384,67 @@ impl Object {
         } else {
             false
         }
+    }
+}
+
+fn find_nearest_surrounding_range(
+    markers: Vec<(char, char)>,
+    map: &DisplaySnapshot,
+    relative_to: DisplayPoint,
+    around: bool,
+    is_multiline: bool,
+) -> Option<Range<DisplayPoint>> {
+    let relative_offset = relative_to.to_offset(map, Bias::Left);
+
+    // Helper function to get range with offset information
+    let get_range_info = |range: &Range<DisplayPoint>| {
+        let start_offset = range.start.to_offset(map, Bias::Left);
+        let end_offset = range.end.to_offset(map, Bias::Right);
+        (start_offset, end_offset, end_offset - start_offset)
+    };
+
+    // Collect all valid ranges
+    let all_ranges: Vec<Range<DisplayPoint>> = markers
+        .iter()
+        .filter_map(|&(open_marker, close_marker)| {
+            surrounding_markers(
+                map,
+                relative_to,
+                around,
+                is_multiline,
+                open_marker,
+                close_marker,
+            )
+        })
+        .collect();
+
+    // Find ranges that contain the cursor
+    let containing_ranges: Vec<&Range<DisplayPoint>> = all_ranges
+        .iter()
+        .filter(|range| {
+            let (start_offset, end_offset, _) = get_range_info(range);
+            relative_offset >= start_offset && relative_offset <= end_offset
+        })
+        .collect();
+
+    if !containing_ranges.is_empty() {
+        // Return the smallest containing range
+        containing_ranges
+            .into_iter()
+            .min_by_key(|range| {
+                let (_, _, length) = get_range_info(range);
+                length
+            })
+            .cloned()
+    } else {
+        // Find the closest range if no containing ranges exist
+        all_ranges
+            .iter()
+            .min_by_key(|range| {
+                let (start_offset, _, _) = get_range_info(range);
+                (relative_offset as isize - start_offset as isize).abs()
+            })
+            .cloned()
     }
 }
 
@@ -599,37 +642,6 @@ fn around_word(
     } else {
         around_next_word(map, relative_to, ignore_punctuation)
     }
-}
-
-/// Calculate distance between a range and a cursor position
-///
-/// Returns a score where:
-/// - Lower values indicate better matches
-/// - Range containing cursor gets priority (returns range length)
-/// - For non-containing ranges, uses minimum distance to boundaries as primary factor
-/// - Range length is used as secondary factor for tiebreaking
-fn calculate_range_distance(
-    range: &Range<DisplayPoint>,
-    cursor_offset: isize,
-    map: &DisplaySnapshot,
-) -> isize {
-    let start_offset = range.start.to_offset(map, Bias::Left) as isize;
-    let end_offset = range.end.to_offset(map, Bias::Right) as isize;
-    let range_length = end_offset - start_offset;
-
-    // If cursor is inside the range, return range length
-    if cursor_offset >= start_offset && cursor_offset <= end_offset {
-        return range_length;
-    }
-
-    // Calculate minimum distance to range boundaries
-    let start_distance = (cursor_offset - start_offset).abs();
-    let end_distance = (cursor_offset - end_offset).abs();
-    let min_distance = start_distance.min(end_distance);
-
-    // Use min_distance as primary factor, range_length as secondary
-    // Multiply by large number to ensure distance is primary factor
-    min_distance * 10000 + range_length
 }
 
 fn around_subword(
@@ -1964,6 +1976,12 @@ mod test {
 
         const TEST_CASES: &[(&str, &str, &str, Mode)] = &[
             // Single quotes
+            (
+                "c i q",
+                "Thisˇ is a '\"quote\"' example.",
+                "This is a 'ˇ' example.",
+                Mode::Insert,
+            ),
             (
                 "c i q",
                 "Thisˇ is a 'quote' example.",
