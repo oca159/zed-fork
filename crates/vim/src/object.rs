@@ -8,11 +8,14 @@ use crate::{
 use editor::{
     display_map::{DisplayRow, DisplaySnapshot, ToDisplayPoint},
     movement::{self, FindRange},
-    Bias, DisplayPoint, Editor,
+    Bias, DisplayPoint, Editor, RangeToAnchorExt, ToOffset,
 };
 use gpui::{actions, impl_actions, Window};
 use itertools::Itertools;
-use language::{BufferSnapshot, CharKind, Point, Selection, TextObject, TreeSitterOptions};
+use language::{
+    BufferSnapshot, CharKind, OffsetRangeExt, Point, Selection, TextObject, ToPoint,
+    TreeSitterOptions,
+};
 use multi_buffer::MultiBufferRow;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -63,7 +66,6 @@ struct IndentObj {
     include_below: bool,
 }
 
-/// Minimal struct to hold the start/end as display points.
 #[derive(Debug, Clone)]
 pub struct CandidateRange {
     pub start: DisplayPoint,
@@ -322,34 +324,44 @@ fn gather_line_brackets(map: &DisplaySnapshot, line: DisplayRow) -> Vec<Candidat
     candidates
 }
 
-//
-// 3) COVER OR NEXT" PICKING
-//
-fn pick_best_range<'a>(
-    candidates: &'a [CandidateRange],
+// Cover or next picking
+fn pick_best_range<I: Iterator<Item = (Range<usize>, Range<usize>)>>(
+    candidates: Option<I>,
     caret: DisplayPoint,
     map: &DisplaySnapshot,
-) -> Option<&'a CandidateRange> {
+) -> Option<CandidateRange> {
     let caret_offset = caret.to_offset(map, Bias::Left);
     let mut covering = vec![];
     let mut next_ones = vec![];
-    let mut prev_ones = vec![];
+    let snapshot = &map.buffer_snapshot;
 
-    for c in candidates {
-        let start_off = c.start.to_offset(map, Bias::Left);
-        let end_off = c.end.to_offset(map, Bias::Right);
-
-        if start_off <= caret_offset && caret_offset < end_off {
-            covering.push(c);
-        } else if start_off >= caret_offset {
-            next_ones.push(c);
-        } else if end_off <= caret_offset {
-            prev_ones.push(c);
+    if let Some(ranges) = candidates {
+        for (open_range, close_range) in ranges {
+            let start_off = open_range.start;
+            let end_off = close_range.end;
+            let c = CandidateRange {
+                start: start_off.to_display_point(map),
+                end: end_off.to_display_point(map),
+            };
+            if open_range
+                .start
+                .to_offset(snapshot)
+                .to_display_point(map)
+                .row()
+                == caret_offset.to_display_point(map).row()
+            {
+                if start_off <= caret_offset && caret_offset < end_off {
+                    covering.push(c);
+                } else if start_off >= caret_offset {
+                    next_ones.push(c);
+                }
+            }
         }
     }
 
     // 1) covering -> smallest width
     if !covering.is_empty() {
+        println!("covering: {:?}", covering);
         return covering.into_iter().min_by_key(|r| {
             r.end.to_offset(map, Bias::Right) - r.start.to_offset(map, Bias::Left)
         });
@@ -357,42 +369,35 @@ fn pick_best_range<'a>(
 
     // 2) next -> closest by start
     if !next_ones.is_empty() {
+        println!("next_ones: {:?}", next_ones);
         return next_ones.into_iter().min_by_key(|r| {
             let start = r.start.to_offset(map, Bias::Left);
             (start as isize - caret_offset as isize).abs()
         });
     }
 
-    // 3) prev -> closest by end
-    if !prev_ones.is_empty() {
-        return prev_ones.into_iter().min_by_key(|r| {
-            let end = r.end.to_offset(map, Bias::Right);
-            (end as isize - caret_offset as isize).abs()
-        });
-    }
-
     None
 }
 
-fn find_any_quotes(
-    map: &DisplaySnapshot,
-    caret: DisplayPoint,
-    around: bool,
-) -> Option<Range<DisplayPoint>> {
-    // 1) gather quotes on caret’s line
-    let line_candidates = gather_line_quotes(map, caret.row());
-    if let Some(best_line) = pick_best_range(&line_candidates, caret, map) {
-        // Found a line-based quote pair => done
-        return finalize_quote_range(best_line.clone(), map, around);
-    }
-
-    // 2) fallback: gather from entire file (multiline)
-    let all_candidates = gather_quotes_multiline(map);
-    let best = pick_best_range(&all_candidates, caret, map)?;
-
-    // 3) Return final range, skipping bounding quote chars if “inner”
-    finalize_quote_range(best.clone(), map, around)
-}
+// fn find_any_quotes(
+//     map: &DisplaySnapshot,
+//     caret: DisplayPoint,
+//     around: bool,
+// ) -> Option<Range<DisplayPoint>> {
+//     // 1) gather quotes on caret’s line
+//     let line_candidates = gather_line_quotes(map, caret.row());
+//     if let Some(best_line) = pick_best_range(&line_candidates, caret, map) {
+//         // Found a line-based quote pair => done
+//         return finalize_quote_range(best_line.clone(), map, around);
+//     }
+//
+//     // 2) fallback: gather from entire file (multiline)
+//     let all_candidates = gather_quotes_multiline(map);
+//     let best = pick_best_range(&all_candidates, caret, map)?;
+//
+//     // 3) Return final range, skipping bounding quote chars if “inner”
+//     finalize_quote_range(best.clone(), map, around)
+// }
 
 /// A tiny helper to do “outer vs. inner” logic for quotes
 fn finalize_quote_range(
@@ -424,23 +429,59 @@ fn finalize_quote_range(
 /// - `around` == false => skip bounding chars.
 fn find_any_brackets(
     map: &DisplaySnapshot,
-    caret: DisplayPoint,
+    display_point: DisplayPoint,
     around: bool,
-) -> Option<std::ops::Range<DisplayPoint>> {
-    // 1) Gather bracket pairs on the caret’s line
-    let line_candidates = gather_line_brackets(map, caret.row());
+) -> Option<Range<DisplayPoint>> {
+    let display_point = map.clip_at_line_end(display_point);
+    let point = display_point.to_point(map);
+    let offset = point.to_offset(&map.buffer_snapshot);
+
+    // Ensure the range is contained by the current line.
+    let mut line_end = map.next_line_boundary(point).0;
+    if line_end == point {
+        line_end = map.max_point().to_point(map);
+    }
+
+    let line_range = map.prev_line_boundary(point).0..line_end;
+    println!("line_range: {:?}", line_range);
+    let visible_line_range =
+        line_range.start..Point::new(line_range.end.row, line_range.end.column.saturating_sub(1));
+    println!("visible_line_range: {:?}", visible_line_range);
+    let ranges = map
+        .buffer_snapshot
+        .bracket_ranges(visible_line_range.clone());
+
     // “cover-or-next” logic in just those
-    if let Some(best_line) = pick_best_range(&line_candidates, caret, map) {
+    if let Some(best_line) = pick_best_range(ranges, display_point, map) {
         // We found a match on the same line => done
-        return finalize_bracket_range(best_line.clone(), map, around);
+        return finalize_bracket_range(best_line.clone(), map, offset, visible_line_range, around);
     }
 
     // 2) If none on the same line, gather from entire buffer (multi-line)
     let all_candidates = gather_brackets_multiline(map);
-    let best = pick_best_range(&all_candidates, caret, map)?;
+    let buffer_ranges = all_candidates.into_iter().filter_map(|cr| {
+        let start_off = cr.start.to_offset(map, Bias::Left);
+        let end_off = cr.end.to_offset(map, Bias::Right);
+        if end_off <= start_off + 1 {
+            None
+        } else {
+            let open_range = start_off..start_off + 1;
+            let close_range = end_off - 1..end_off;
+            Some((open_range, close_range))
+        }
+    });
 
-    // 3) Return the final range, skipping bounding chars if `around == false`
-    finalize_bracket_range(best.clone(), map, around)
+    if let Some(best_buffer) = pick_best_range(Some(buffer_ranges), display_point, map) {
+        return finalize_bracket_range(
+            best_buffer.clone(),
+            map,
+            offset,
+            visible_line_range,
+            around,
+        );
+    }
+
+    None
 }
 
 /// A small helper to handle the “inner vs. outer” logic for bracket textobjects.
@@ -448,6 +489,8 @@ fn find_any_brackets(
 fn finalize_bracket_range(
     pair: CandidateRange,
     map: &DisplaySnapshot,
+    offset: usize,
+    visible_line_range: Range<Point>,
     around: bool,
 ) -> Option<std::ops::Range<DisplayPoint>> {
     if around {
@@ -455,18 +498,47 @@ fn finalize_bracket_range(
         return Some(pair.start..pair.end);
     }
 
-    // “inner”: skip the bounding chars if possible
-    let start_off = pair.start.to_offset(map, Bias::Left);
-    let end_off = pair.end.to_offset(map, Bias::Right);
+    println!("pair: {:?}", pair);
+    println!("offset: {:?}", offset);
 
-    if end_off.saturating_sub(start_off) < 2 {
-        // Not enough room to skip
-        return None;
+    let snapshot = &map.buffer_snapshot;
+
+    // The `argument` vim text object uses the syntax tree, so we operate at the buffer level and map back to the display level
+    let excerpt = snapshot.excerpt_containing(offset..offset)?;
+    let buffer = excerpt.buffer();
+    let line_start = visible_line_range.start.to_display_point(map);
+    let line_end = visible_line_range.end.to_display_point(map);
+    println!("line_start: {:?}", line_start);
+    println!("line_end: {:?}", line_end);
+
+    if pair.start.row() == line_start.row() {
+        return Some(pair.start..pair.end);
     }
 
-    // Shift start +1, end -1
-    let new_start = DisplayPoint::new(pair.start.row(), pair.start.column() + 1);
-    let new_end = DisplayPoint::new(pair.end.row(), pair.end.column().saturating_sub(1));
+    let bracket_filter = |open: Range<usize>, close: Range<usize>| {
+        // Filter out empty ranges
+        if open.end == close.start {
+            return false;
+        }
+
+        // If the cursor is outside the brackets, ignore them
+        if open.start == offset || close.end == offset {
+            return false;
+        }
+
+        // TODO: Is there any better way to filter out string brackets?
+        // Used to filter out string brackets
+        matches!(
+            buffer.chars_at(open.start).next(),
+            Some('(' | '[' | '{' | '<' | '|')
+        )
+    };
+
+    let (open_bracket, close_bracket) =
+        buffer.innermost_enclosing_bracket_ranges(offset..offset, Some(&bracket_filter))?;
+
+    let new_start = open_bracket.end.to_display_point(map);
+    let new_end = close_bracket.start.to_display_point(map);
 
     Some(new_start..new_end)
 }
@@ -711,7 +783,7 @@ impl Object {
             Object::BackQuotes => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '`', '`')
             }
-            Object::AnyQuotes => find_any_quotes(map, relative_to, around),
+            Object::AnyQuotes => find_any_brackets(map, relative_to, around),
             Object::DoubleQuotes => {
                 surrounding_markers(map, relative_to, around, self.is_multiline(), '"', '"')
             }
